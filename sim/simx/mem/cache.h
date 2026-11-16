@@ -68,6 +68,14 @@ public:
 		uint64_t mshr_stalls = 0;
 		uint64_t mem_latency = 0;
 
+		uint64_t prefetch_hits = 0;
+		uint64_t prefetch_misses = 0;
+		uint64_t prefetch_merges = 0;
+
+		uint64_t demand_hits = 0;
+		uint64_t demand_misses = 0;
+		uint64_t demand_merges = 0;
+
 		PerfStats& operator+=(const PerfStats& rhs) {
 			this->reads += rhs.reads;
 			this->writes += rhs.writes;
@@ -77,6 +85,13 @@ public:
 			this->bank_stalls += rhs.bank_stalls;
 			this->mshr_stalls += rhs.mshr_stalls;
 			this->mem_latency += rhs.mem_latency;
+			this->prefetch_hits += rhs.prefetch_hits;
+			this->prefetch_misses += rhs.prefetch_misses;
+			this->prefetch_merges += rhs.prefetch_merges;
+
+			this->demand_hits += rhs.demand_hits;
+			this->demand_misses += rhs.demand_misses;
+			this->demand_merges += rhs.demand_merges;
 			return *this;
 		}
 	};

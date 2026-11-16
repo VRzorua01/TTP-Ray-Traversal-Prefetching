@@ -63,6 +63,12 @@ void read_scene_bytes(SceneView& sv, uint32_t off, uint32_t len, uint8_t* out) {
   }
 }
 
+uint64_t scene_line_addr(const SceneView& sv, uint32_t off) {
+  const uint64_t pos = uint64_t(sv.byte_off) + off;
+  return sv.base_line
+       + (pos / VX_CFG_MEM_BLOCK_SIZE) * VX_CFG_MEM_BLOCK_SIZE;
+}
+
 // Copy a 3-vector (object-space ray capture helper).
 inline void vcopy3(float dst[3], const float src[3]) {
   dst[0] = src[0]; dst[1] = src[1]; dst[2] = src[2];
@@ -151,6 +157,11 @@ struct ShortStack {
   uint32_t trl_rank = 0;
   bool     restart  = false;   // the walk must unwind and start over
   uint64_t visits   = 0;
+  uint8_t  pop_trend = 0;
+  // One-past index of the next stack entry to prefetch. The stack grows
+  // toward larger indices; prefetching walks toward smaller indices.
+  // Only a real push resets this pointer (TTP paper, Fig. 9).
+  size_t   prefetch_next = 0;
 
   void set_path(uint32_t lvl, uint32_t rank) {
     if (lvl < kLevels) path[lvl] = rank;
@@ -159,6 +170,43 @@ struct ShortStack {
     return (lvl < kLevels) ? path[lvl] : 0;
   }
 };
+
+// Call these only after a physical stack operation. A descent to the first
+// child is *not* a stack push/pop in this ShortStack representation.
+void record_stack_push(ShortStack& ss, SceneView& sv, PerfStats& perf) {
+  ++perf.bvh_stack_pushes;
+  ss.pop_trend = 0;
+  ss.prefetch_next = ss.entries.size();  // reset pointer to top on push
+  if (sv.ttp_enabled) ++sv.ttp_seen_events;
+}
+
+// Called after removing the current demand entry from ss.entries. The stack
+// therefore contains only future traversal work. A prefetch cursor is retained
+// across consecutive pops so the same entry is not offered repeatedly.
+void record_stack_pop(ShortStack& ss, SceneView& sv, PerfStats& perf) {
+  ++perf.bvh_stack_pops;
+  if (!sv.ttp_enabled) return;
+  const bool newly_executed = ++sv.ttp_seen_events > sv.ttp_processed_events;
+
+  if (ss.pop_trend < 3) ++ss.pop_trend;
+  const size_t lookahead = (ss.pop_trend == 1) ? 1
+                           : (ss.pop_trend == 2) ? 2 : 16;
+  const size_t top = ss.entries.size();
+  const size_t lower = (top > lookahead) ? top - lookahead : 0;
+
+  // A pop may consume the entry the cursor was pointing at. Clamp to the
+  // new stack top without resetting to it: the prefetch pointer only resets
+  // on an actual push.
+  ss.prefetch_next = std::min(ss.prefetch_next, top);
+  while (ss.prefetch_next > lower) {
+    --ss.prefetch_next;
+    const auto& entry = ss.entries[ss.prefetch_next];
+    // Advance the reconstructed cursor even for previously replayed events;
+    // only new pops can emit a request to the real memory engine.
+    if (newly_executed)
+      sv.prefetch_lines.push_back(scene_line_addr(sv, entry.off));
+  }
+}
 
 // Depth-first walker for one BVH sub-tree under the supplied (object-space)
 // ray, rooted at level root_lvl. Recurses on LeafInst so each instance's BLAS
@@ -327,6 +375,7 @@ void walk_bvh4_subtree(SceneView& sv,
       ++perf.bvh_instance_descents;
       // The BLAS root sits at the instance level, ranked by its index.
       ss.set_path(lvl + 1, i);
+      // Entering a BLAS is a descent, not a physical ShortStack pop.
       walk_bvh4_subtree(sv, obj_ro, obj_rd,
                         inst->blas_root_byte_offset, lvl + 1,
                         inst->instance_id,
@@ -443,12 +492,15 @@ void walk_bvh4_subtree(SceneView& sv,
         for (uint32_t i = hit_count; i-- > dsc + 1; ) {
           if (ss.entries.size() < VX_CFG_RTU_STACK_DEPTH) {
             ss.entries.push_back({lvl + 1, i, hits[i].offset});
+            record_stack_push(ss, sv, perf);
           } else {
             ss.ovf     = true;
             ss.nd_lvl  = lvl + 1;
             ss.nd_rank = i;
           }
         }
+        // The closest child is traversed directly, not pushed onto
+        // ss.entries. Only the farther, pending children above were pushed.
         current = hits[dsc].offset;
         ++lvl;
         ss.set_path(lvl, dsc);
@@ -469,6 +521,7 @@ void walk_bvh4_subtree(SceneView& sv,
     ss.follow = false;
     const ShortStack::Entry e = ss.entries.back();
     ss.entries.pop_back();
+    record_stack_pop(ss, sv, perf);
     current = e.off;
     lvl     = e.lvl;
     ss.set_path(e.lvl, e.rank);
@@ -776,6 +829,16 @@ WalkResult Bvh4Walker::walk_lane(const RtuReq& req, uint32_t t, SceneView& sv,
   // Top-level (non-instanced) triangles carry no instance flags.
   ShortStack ss;
   ss.entries.reserve(VX_CFG_RTU_STACK_DEPTH);
+  // Keep a consistent checkpoint even when traversal returns on a line miss.
+  struct TtpCheckpoint {
+    SceneView& sv;
+    ShortStack& ss;
+    ~TtpCheckpoint() {
+      sv.ttp_final_pop_trend = ss.pop_trend;
+      sv.ttp_final_cursor = uint32_t(ss.prefetch_next);
+    }
+  } ttp_checkpoint{sv, ss};
+  // The root is entered directly; ss.entries initially holds no pending nodes.
   for (;;) {
     walk_bvh4_subtree(sv, ro, rd, root_off, 0, 0, 0, 0, ctx, ss, perf);
     if (sv.miss) return {true, false};
@@ -783,6 +846,9 @@ WalkResult Bvh4Walker::walk_lane(const RtuReq& req, uint32_t t, SceneView& sv,
     ss.entries.clear();
     ss.restart  = false;
     ss.ovf      = false;
+    ss.pop_trend = 0;
+    ss.prefetch_next = 0;
+    if (sv.ttp_enabled) ++sv.ttp_seen_events; // stack-clearing restart
     ss.follow   = true;
     ss.trl_lvl  = ss.nd_lvl;
     ss.trl_rank = ss.nd_rank;

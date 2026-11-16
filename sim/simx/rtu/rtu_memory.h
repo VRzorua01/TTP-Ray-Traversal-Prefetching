@@ -18,17 +18,20 @@
 //
 //   SELECT — pick one context (round-robin, so no context starves).
 //   MSHR   — allocate an entry for the line and issue exactly one load.
+//   TTP    — issue queued speculative lines only when no demand is ready.
 //
 // Duplicate fetches are not coalesced: one context, one tag, one fetch. A
 // coherent warp descending a shared tree therefore re-requests each node once
 // per ray, and the caches absorb it.
 //
-// The response side fans one line out to every context waiting on its entry.
+// Demand responses fan one line out to every waiter. Prefetch responses only
+// retire their MSHR; the cache fill makes the line available to later demand.
 
 #ifndef _VX_RTU_MEMORY_H_
 #define _VX_RTU_MEMORY_H_
 
 #include <cstdint>
+#include <deque>
 #include <unordered_map>
 #include <vector>
 
@@ -51,17 +54,20 @@ public:
   void reset();
 
   // SELECT -> MSHR -> issue. At most one distinct line leaves the RTU
-  // per port per tick.
+  // per port per tick. Demand requests have priority over speculative fills.
   void issue_memory();
 
   // Drain one response per port; fan the line out to every waiting context.
   void drain_mem_rsp();
+  void queue_prefetches(const std::vector<uint64_t>& addresses);
 
 private:
-  // One in-flight line fetch and the contexts riding on it — without
-  // coalescing, always the single context that requested it.
+  // One in-flight line fetch. Demand entries have waiters; a prefetch entry
+  // has none and records whether demand reached it before the response.
   struct Mshr {
     bool     valid = false;
+    bool     prefetch = false;
+    bool     prefetch_used = false;
     uint64_t addr  = 0;
     std::vector<uint32_t> waiters;
   };
@@ -76,6 +82,9 @@ private:
   // disabled each fetch still gets an entry, it just never gains a second
   // waiter, so one code path serves both.
   std::unordered_map<uint32_t, uint32_t> pending_;
+  std::deque<uint64_t> prefetch_queue_;
+  std::unordered_map<uint64_t, bool> queued_prefetches_;
+  std::unordered_map<uint64_t, bool> prefetched_lines_;
   uint32_t next_tag_ = 0;
   uint32_t rr_ctx_   = 0;   // SELECT rotation
 };

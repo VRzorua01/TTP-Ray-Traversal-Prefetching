@@ -357,9 +357,11 @@ int main(int argc, char** argv) {
   std::vector<uint8_t> scene = serialize(b.nodes, root, tris);
   std::cout << "CW-BVH4: " << b.nodes.size() << " nodes, "
             << scene.size() << " bytes\n";
-  if (scene.size() > 16384) {
-    std::cerr << "scene exceeds 16 KB RTU pre-fetch budget; use a smaller mesh\n";
-    return 1;
+  constexpr size_t kMaxTestSceneBytes = 8 * 1024 * 1024;
+
+  if (scene.size() > kMaxTestSceneBytes) {
+      std::cerr << "scene exceeds 8 MB test limit\n";
+      return 1;
   }
 
   // Per-triangle shading data (indexed by geometry_index = tri id).

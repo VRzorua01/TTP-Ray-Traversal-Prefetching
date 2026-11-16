@@ -32,6 +32,7 @@
 #include <cstdint>
 #include <ostream>
 #include <unordered_map>
+#include <vector>
 #include "instr_trace.h"
 #include "constants.h"
 #include "types.h"
@@ -483,6 +484,15 @@ struct SceneView {
   uint32_t byte_off  = 0;   // scene base within that line
   bool     miss      = false;
   uint64_t miss_line = 0;
+  bool     ttp_enabled = false;
+  std::vector<uint64_t> prefetch_lines;
+  // The functional walker replays the ray from its root after each line miss.
+  // Each physical stack push/pop receives one event number on every replay.
+  // Only events beyond the context's committed prefix may emit prefetches.
+  uint64_t ttp_processed_events = 0;  // input: high-water mark from Context
+  uint64_t ttp_seen_events = 0;       // output: events in this replay
+  uint8_t  ttp_final_pop_trend = 0;   // diagnostic snapshot of reconstructed FSM
+  uint32_t ttp_final_cursor = 0;     // diagnostic snapshot of reconstructed cursor
 };
 
 struct Context {
@@ -513,6 +523,14 @@ struct Context {
   // root, so the work of the newest step is the difference against these.
   uint64_t chg_box = 0, chg_tri = 0, chg_inst = 0, chg_restart = 0;
   uint64_t chg_nodes = 0, chg_leaves = 0;
+  uint64_t chg_stack_pushes = 0, chg_stack_pops = 0;
+  // TTP is replay-aware: do not submit speculative requests a second time
+  // for pushes/pops already traversed by an earlier probe of this ray.
+  // The walker reconstructs the pointer and pop FSM from the deterministic
+  // stack-event prefix; only its progress watermark must survive a stall.
+  uint64_t ttp_processed_events = 0;
+  uint8_t  ttp_last_pop_trend = 0;
+  uint32_t ttp_last_cursor = 0;
 };
 
 // Shader queue entry. One per yielded (slot, lane). The
@@ -558,6 +576,8 @@ struct PerfStats {
   // Trail restarts of the VX_CFG_RTU_STACK_DEPTH short stack. The node, box and
   // descent counts above include the restarted walks' re-descents.
   uint64_t bvh_stack_restarts    = 0;
+  uint64_t bvh_stack_pushes      = 0;
+  uint64_t bvh_stack_pops        = 0;
   // Callback-pipeline counters: candidate lanes returned to the warp, by type.
   uint64_t ahs_callbacks       = 0;
   uint64_t chs_callbacks       = 0;
@@ -574,6 +594,9 @@ struct PerfStats {
   // end is the bottleneck, collapsing duplicate fetches saves bandwidth, not
   // time.
   uint64_t mem_issue_ticks      = 0;
+  uint64_t prefetch_requests    = 0;
+  uint64_t prefetch_responses   = 0;
+  uint64_t prefetch_useful      = 0;
   uint64_t front_end_busy_ticks = 0;
   // Fetches the front end folded onto an already-in-flight line: the leader
   // compare catches contexts that go runnable together, the MSHR CAM catches
@@ -604,6 +627,8 @@ struct PerfStats {
     bvh_instance_descents  += rhs.bvh_instance_descents;
     bvh_box_tests          += rhs.bvh_box_tests;
     bvh_stack_restarts     += rhs.bvh_stack_restarts;
+    bvh_stack_pushes       += rhs.bvh_stack_pushes;
+    bvh_stack_pops         += rhs.bvh_stack_pops;
     bvh_tri_tests          += rhs.bvh_tri_tests;
     ahs_callbacks          += rhs.ahs_callbacks;
     chs_callbacks          += rhs.chs_callbacks;
@@ -614,6 +639,9 @@ struct PerfStats {
     coherency_misses       += rhs.coherency_misses;
     front_end_busy_ticks   += rhs.front_end_busy_ticks;
     mem_issue_ticks        += rhs.mem_issue_ticks;
+    prefetch_requests      += rhs.prefetch_requests;
+    prefetch_responses     += rhs.prefetch_responses;
+    prefetch_useful        += rhs.prefetch_useful;
     fetches_merged         += rhs.fetches_merged;
     mshr_full_stalls       += rhs.mshr_full_stalls;
     ctx_bound_ticks        += rhs.ctx_bound_ticks;

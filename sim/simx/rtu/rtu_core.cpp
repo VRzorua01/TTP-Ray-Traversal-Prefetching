@@ -36,6 +36,13 @@ using namespace vortex::rtu;
 
 namespace {
 
+// Keep baseline traversal timing unless the speculative path is explicitly
+// enabled for a SimX run.
+bool ttp_enabled_from_env() {
+  const char* env = std::getenv("VX_RTU_TTP");
+  return env != nullptr && env[0] == '1';
+}
+
 // ────────────────────────────────────────────────────────────────────
 // SlotPool — the resident-trace array. A slot stages one vx_rt_wtrace: its
 // rays, its control state, its result record. Slots partition statically across
@@ -234,6 +241,7 @@ class RtuCore::Impl {
 public:
   explicit Impl(RtuCore* simobject)
     : simobject_(simobject)
+    , ttp_enabled_(ttp_enabled_from_env())
     , pool_(VX_CFG_RTU_NUM_SLOTS)
     , contexts_(VX_CFG_RTU_NUM_CTX)
     , perf_stats_()
@@ -254,6 +262,9 @@ public:
         "[rtu-stats] slots=%u ctx=%u merge=%u\n"
         "[rtu-stats] traces=%llu rays=%llu rays_hit=%llu rays_miss=%llu\n"
         "[rtu-stats] mem_reads=%llu fetches_merged=%llu mshr_full=%llu\n"
+        "[rtu-stats] ttp=%u prefetch_requests=%llu prefetch_responses=%llu "
+        "prefetch_useful=%llu prefetch_unused=%llu\n"
+        "[rtu-stats] stack_pushes=%llu stack_pops=%llu\n"
         "[rtu-stats] bvh_nodes=%llu bvh_leaves=%llu box_tests=%llu tri_tests=%llu\n"
         "[rtu-stats] busy_ticks=%llu front_end_ticks=%llu mem_issue_ticks=%llu\n"
         "[rtu-stats] slot_busy_ticks=%llu ctx_bound_ticks=%llu ctx_active_ticks=%llu\n"
@@ -267,6 +278,13 @@ public:
         (unsigned long long)p.mem_reads,
         (unsigned long long)p.fetches_merged,
         (unsigned long long)p.mshr_full_stalls,
+        unsigned(ttp_enabled_),
+        (unsigned long long)p.prefetch_requests,
+        (unsigned long long)p.prefetch_responses,
+        (unsigned long long)p.prefetch_useful,
+        (unsigned long long)(p.prefetch_responses - p.prefetch_useful),
+        (unsigned long long)p.bvh_stack_pushes,
+        (unsigned long long)p.bvh_stack_pops,
         (unsigned long long)p.bvh_nodes_fetched,
         (unsigned long long)p.bvh_leaves_fetched,
         (unsigned long long)p.bvh_box_tests,
@@ -526,6 +544,8 @@ public:
     sv.lines     = &cx.lines;
     sv.base_line = cx.base_line;
     sv.byte_off  = cx.byte_off;
+    sv.ttp_enabled = ttp_enabled_;
+    sv.ttp_processed_events = cx.ttp_processed_events;
 
     PerfStats walk;   // cumulative over the replayed prefix
     LaneState result = s.lanes[cx.lane];
@@ -534,23 +554,43 @@ public:
 #else
     WalkResult r = bvh4_walker_.walk_lane(s.req, cx.lane, sv, result, walk);
 #endif
+    // Functional replay reconstructs its stack and predictor each time. Only
+    // previously unseen stack events are allowed to enqueue prefetches.
+    // Commit the watermark after the walk returns (including a memory stall).
+    if (ttp_enabled_) {
+      if (sv.ttp_seen_events < cx.ttp_processed_events) {
+        // A changed replay prefix would invalidate the event-based watermark.
+        // Catch it instead of silently accepting a non-monotonic history.
+        assert(false && "TTP stack-event replay prefix shrank");
+      }
+      cx.ttp_processed_events = sv.ttp_seen_events;
+      cx.ttp_last_pop_trend = sv.ttp_final_pop_trend;
+      cx.ttp_last_cursor = sv.ttp_final_cursor;
+    }
+    mem_engine_.queue_prefetches(sv.prefetch_lines);
 
     uint32_t box     = uint32_t(walk.bvh_box_tests         - cx.chg_box);
     uint32_t tri     = uint32_t(walk.bvh_tri_tests         - cx.chg_tri);
     uint32_t inst    = uint32_t(walk.bvh_instance_descents - cx.chg_inst);
     uint32_t restart = uint32_t(walk.bvh_stack_restarts    - cx.chg_restart);
+    uint32_t pushes  = uint32_t(walk.bvh_stack_pushes      - cx.chg_stack_pushes);
+    uint32_t pops    = uint32_t(walk.bvh_stack_pops        - cx.chg_stack_pops);
     uint32_t nodes   = uint32_t(walk.bvh_nodes_fetched     - cx.chg_nodes);
     uint32_t leaves  = uint32_t(walk.bvh_leaves_fetched    - cx.chg_leaves);
     perf_stats_.bvh_box_tests         += box;
     perf_stats_.bvh_tri_tests         += tri;
     perf_stats_.bvh_instance_descents += inst;
     perf_stats_.bvh_stack_restarts    += restart;
+    perf_stats_.bvh_stack_pushes      += pushes;
+    perf_stats_.bvh_stack_pops        += pops;
     perf_stats_.bvh_nodes_fetched     += nodes;
     perf_stats_.bvh_leaves_fetched    += leaves;
     cx.chg_box     = walk.bvh_box_tests;
     cx.chg_tri     = walk.bvh_tri_tests;
     cx.chg_inst    = walk.bvh_instance_descents;
     cx.chg_restart = walk.bvh_stack_restarts;
+    cx.chg_stack_pushes = walk.bvh_stack_pushes;
+    cx.chg_stack_pops   = walk.bvh_stack_pops;
     cx.chg_nodes   = walk.bvh_nodes_fetched;
     cx.chg_leaves  = walk.bvh_leaves_fetched;
 
@@ -761,6 +801,7 @@ public:
 
 private:
   RtuCore*             simobject_;
+  bool                 ttp_enabled_;
   SlotPool             pool_;
   std::vector<Context> contexts_;
   RtuCore::PerfStats   perf_stats_;

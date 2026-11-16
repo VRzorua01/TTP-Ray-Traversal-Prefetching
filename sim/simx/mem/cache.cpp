@@ -21,6 +21,8 @@
 #endif
 #include <algorithm>
 #include <cstring>
+#include <cstdio>
+#include <string>
 #include <list>
 #include <queue>
 #include <unordered_map>
@@ -487,6 +489,7 @@ struct bank_req_t {
   // AMO state. memop_is_atomic(op) classifies the request; the LSU
   // packs rs2 into data at byte_off, so the cache extracts rhs via
   // amo_load_word and width via byteen popcount.
+  bool is_prefetch = false;
 
   bank_req_t() {
     this->reset();
@@ -511,6 +514,7 @@ struct bank_req_t {
     amo_cmp = 0;
     flags = MemFlags{};
     adm_seq = 0;
+    is_prefetch = false;
   }
 
   friend std::ostream &operator<<(std::ostream &os, const bank_req_t &req) {
@@ -813,6 +817,27 @@ public:
     this->on_reset();
   }
 
+  struct TTPStats {
+    uint64_t prefetch_hits = 0;
+    uint64_t prefetch_misses = 0;  // misses starting new fills
+    uint64_t prefetch_merges = 0;  // requests joining pending fills / ordered chains
+    uint64_t demand_hits = 0;
+    uint64_t demand_misses = 0;
+    uint64_t demand_merges = 0;
+
+    TTPStats& operator+=(const TTPStats& rhs) {
+      prefetch_hits += rhs.prefetch_hits;
+      prefetch_misses += rhs.prefetch_misses;
+      prefetch_merges += rhs.prefetch_merges;
+      demand_hits += rhs.demand_hits;
+      demand_misses += rhs.demand_misses;
+      demand_merges += rhs.demand_merges;
+      return *this;
+    }
+  };
+
+  const TTPStats& ttp_stats() const { return ttp_stats_; }
+
   const Cache::PerfStats &perf_stats() const {
     return perf_stats_;
   }
@@ -1084,6 +1109,7 @@ private:
         bank_req.data    = mem_rsp.data;
         bank_req.refetch = root_peek.refetch;
         bank_req.refetch_retry = root_peek.refetch_retry;
+        bank_req.is_prefetch = root_peek.bank_req.is_prefetch;
         pipe_req_->push(bank_req);
         // The chain wakes at accept: its replays enter the pipe behind the fill,
         // so they reach the array after the install. The forward window answers
@@ -1130,6 +1156,7 @@ private:
         bank_req.nodata  = true;
         bank_req.refetch = root_peek.refetch;
         bank_req.refetch_retry = root_peek.refetch_retry;
+        bank_req.is_prefetch = root_peek.bank_req.is_prefetch;
         pipe_req_->push(bank_req);
         mshr_.replay(mshr_id);
         // A looped-back refetch completes a fully written sector: like a
@@ -1278,6 +1305,7 @@ private:
             coalesced.byteen  = core_req.byteen;
             coalesced.amo_cmp = core_req.amo_cmp;
             coalesced.flags   = core_req.flags;
+            coalesced.is_prefetch = core_req.is_prefetch;
             assert(!mshr_.full());
             int id = mshr_.enqueue(coalesced, adm_set_id, adm_addr_tag, adm_sector);
             // Drain-only join (ordering case): nothing will mark our entry —
@@ -1295,6 +1323,10 @@ private:
             } else {
               ++perf_stats_.reads;
               ++perf_stats_.read_misses;
+            }
+            if (!core_req.is_write() && !is_amo) {
+              if (core_req.is_prefetch) ++ttp_stats_.prefetch_merges;
+              else                      ++ttp_stats_.demand_merges;
             }
             this->core_req_in.pop();
             return;
@@ -1321,6 +1353,7 @@ private:
       bank_req.byteen  = core_req.byteen;
       bank_req.amo_cmp = core_req.amo_cmp;
       bank_req.flags   = core_req.flags;
+      bank_req.is_prefetch = core_req.is_prefetch;
       pipe_req_->push(bank_req);
       DT(3, this->name() << " core-req: " << core_req);
       // pending_mshr_size_ tracks Core-typed in-flight requests so the
@@ -2008,6 +2041,13 @@ private:
         if (need_rsp && this->core_rsp_out.full())
           return;
 
+        // Count each *original* accepted cache hit once. Replay/forward hits
+        // are completions of misses and are deliberately excluded.
+        if (!bank_req.write && !memop_is_atomic(bank_req.op)) {
+          if (bank_req.is_prefetch) ++ttp_stats_.prefetch_hits;
+          else                      ++ttp_stats_.demand_hits;
+        }
+
         auto &hit_sec = set.lines.at(hit_id).sectors.at(sector_id);
         if (bank_req.write) {
           sector_merge(hit_sec, bank_req.data, bank_req.byteen);
@@ -2050,6 +2090,9 @@ private:
           DT(3, this->name() << " core-rsp: " << rsp);
         }
       } else {
+        // Capture this before enqueueing: after enqueue, looking up the MSHR
+        // would find our own request and falsely classify a new miss as merged.
+        const bool ttp_existing_fill = mshr_.has_pending_fill(set_id, addr_tag, sector_id, -1);
         // Cache miss.
         if (config_.write_around && bank_req.write && bank_req.flags.noalloc
          && !mshr_.lookup(set_id, addr_tag, sector_id)) {
@@ -2123,6 +2166,15 @@ private:
             this->send_mem_req(fill);
             DT(3, this->name() << " fill-req: " << fill);
             ++pending_fill_reqs_;
+          }
+        }
+        if (!bank_req.write && !memop_is_atomic(bank_req.op)) {
+          if (ttp_existing_fill) {
+            if (bank_req.is_prefetch) ++ttp_stats_.prefetch_merges;
+            else                      ++ttp_stats_.demand_merges;
+          } else {
+            if (bank_req.is_prefetch) ++ttp_stats_.prefetch_misses;
+            else                      ++ttp_stats_.demand_misses;
           }
         }
         if (bank_req.write) ++perf_stats_.write_misses;
@@ -2289,6 +2341,7 @@ private:
   TFifo<uint32_t>::Ptr   lazy_q_;   // roots awaiting a data-less fill: write misses and written refetches
 
   Cache::PerfStats perf_stats_;
+  TTPStats ttp_stats_;
 
   uint64_t pending_read_reqs_;
   uint64_t pending_write_reqs_;
@@ -3469,6 +3522,14 @@ public:
     fwd_done_ = 0;
   }
 
+  CacheBank::TTPStats ttp_stats() const {
+    CacheBank::TTPStats stats;
+    if (!config_.bypass) {
+      for (const auto& bank : banks_) stats += bank->ttp_stats();
+    }
+    return stats;
+  }
+
   PerfStats perf_stats() const {
     PerfStats perf_stats;
     if (!config_.bypass) {
@@ -3584,6 +3645,22 @@ Cache::Cache(const SimContext &ctx, const char *name, const Config &config)
     : SimObject<Cache>(ctx, name), core_req_in(config.num_inputs, this), core_rsp_out(config.num_inputs, this), mem_req_out(config.mem_ports, this), mem_rsp_in(config.mem_ports, this), impl_(new Impl(this, config)) {}
 
 Cache::~Cache() {
+  // Diagnostic only: counts accepted original RTCache reads, not replay hits.
+  // Printed on destruction so no cache.h or external API change is required.
+  if (name().find("rtcache") != std::string::npos ||
+      name().find("RTCache") != std::string::npos) {
+    const auto stats = impl_->ttp_stats();
+    std::fprintf(stderr,
+        "[ttp-cache] cache=%s demand_hits=%llu demand_misses=%llu demand_merges=%llu "
+        "prefetch_hits=%llu prefetch_misses=%llu prefetch_merges=%llu\n",
+        name().c_str(),
+        (unsigned long long)stats.demand_hits,
+        (unsigned long long)stats.demand_misses,
+        (unsigned long long)stats.demand_merges,
+        (unsigned long long)stats.prefetch_hits,
+        (unsigned long long)stats.prefetch_misses,
+        (unsigned long long)stats.prefetch_merges);
+  }
   delete impl_;
 }
 

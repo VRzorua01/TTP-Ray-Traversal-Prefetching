@@ -1300,6 +1300,7 @@ struct MemReq {
   uint32_t hart_id;
   uint64_t uuid;
   MemFlags flags;
+  bool is_prefetch = false;
   // Under cache line merging: the tags of the ports merged into this read, by
   // offset in the leader's merge group. They ride the bank access and its
   // response, as in the hardware's bank tag.
