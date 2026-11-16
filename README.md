@@ -144,15 +144,95 @@ Some modified logic is spread across multiple files: `rtu_walker.cpp` predicts *
 
 ## Build and run
 
-### Prerequisites
+### Fresh installation (Ubuntu / WSL2)
 
-A working Vortex checkout with its toolchain, SimX runtime, and ray-tracing test configured. If setting up from a fresh checkout, initialize the repository's submodules:
+**You do not need to install a separate copy of Vortex first.** This repository is a **modified Vortex source tree**, not a standalone RTU plugin. Cloning this project gives you Vortex plus the TTP changes. You must still install the host dependencies and the Vortex compiler/runtime toolchain to build and run the simulator. An existing Vortex toolchain under `~/tools` may be reused when compatible.
+
+The following instructions target Ubuntu (including Ubuntu running under WSL2). Install Git and a C/C++ build environment first if necessary:
 
 ```bash
+sudo apt update
+sudo apt install -y git build-essential cmake python3
+```
+
+**1. Clone this TTP-enabled Vortex fork directly:**
+
+```bash
+mkdir -p ~/vortex
+cd ~/vortex
+git clone --recursive --branch ttp-replay-aware \
+  https://github.com/VRzorua01/TTP-Ray-Traversal-Prefetching.git ttp
+cd ~/vortex/ttp
+git submodule sync --recursive
 git submodule update --init --recursive
 ```
 
-The commands below assume an **out-of-tree build directory** at `~/vortex/ttp/build`; adjust the path for your installation. The RTU extension must remain enabled when compiling SimX.
+The `ttp-replay-aware` branch contains the tested replay-aware implementation **once its changes have been committed and pushed**. Check that the remote branch actually includes the expected source changes; merely creating a branch on GitHub does not upload uncommitted files. To use another branch, substitute its name in `--branch`.
+
+**2. Install Vortex's system dependencies:**
+
+```bash
+cd ~/vortex/ttp
+sudo ./ci/install_dependencies.sh
+```
+
+**3. Configure the build (32-bit Vortex):**
+
+```bash
+cd ~/vortex/ttp
+mkdir -p build
+cd build
+../configure --xlen=32 --tooldir="$HOME/tools"
+```
+
+**4. Install the prebuilt Vortex toolchain, if you don't already have the compatible toolchain:**
+
+```bash
+cd ~/vortex/ttp/build
+./ci/toolchain_install.sh
+```
+
+This downloads Vortex's compiler/simulator toolchain into the configured tools directory and may involve substantial downloads. If you already set up Vortex in WSL, you may be able to reuse your existing `~/tools` directory rather than reinstalling it; ensure it matches this checkout's toolchain requirements.
+
+**5. Build the SimX runtime and raycast test:**
+
+```bash
+cd ~/vortex/ttp/build
+make -C sw/runtime/simx -j4 CONFIGS="-DVX_CFG_EXT_RTU_ENABLE"
+make -C tests/raytracing/rt_raycast -j4 CONFIGS="-DVX_CFG_EXT_RTU_ENABLE"
+```
+
+These are **targeted builds** for the SimX experiment, intended to avoid compiling the whole RTL/Verilator simulator. Depending on the toolchain and checkout state, additional base runtime or kernel libraries may be needed. If a targeted build reports a missing dependency or library, follow the build error and Vortex's root [installation instructions](https://github.com/vortexgpgpu/vortex#quick-start) to build the missing component. A full `make` may compile substantially more than SimX, and the latest upstream Vortex build layout can differ from this RTU-enabled fork.
+
+**6. Run a small baseline and TTP-enabled test:**
+
+```bash
+cd ~/vortex/ttp/build/tests/raytracing/rt_raycast
+export LD_LIBRARY_PATH="$HOME/vortex/ttp/build/sw/runtime:${LD_LIBRARY_PATH:-}"
+MODEL="$HOME/vortex/ttp/tests/regression/raycast/assets/dragon.obj"
+
+# Check that the model exists in the cloned branch.
+test -f "$MODEL" || echo "dragon.obj not found: use another bundled OBJ or add the model"
+
+for TTP in 0 1; do
+  VX_RTU_TTP="$TTP" VX_RTU_STATS=1 VORTEX_DRIVER=simx \
+    ./rt_raycast -m "$MODEL" -w 16 -h 16 \
+    2>&1 | tee "/tmp/dragon-16x16-$TTP.log"
+  status=${PIPESTATUS[0]}
+  echo "TTP=$TTP exit code: $status"
+  if [ "$status" -ne 0 ]; then break; fi
+done
+```
+
+A working run should print `PERF:`, `[ttp-cache]`, `[rtu-stats]`, and `PASSED!`. If `dragon.obj` has not been committed to this branch or is unavailable, replace `MODEL` with an existing `.obj` in `tests/regression/raycast/assets/` and rerun. The performance numbers below depend on the scene and simulator configuration.
+
+### If Vortex is already installed
+
+You can keep a separate upstream Vortex checkout for other work, but **do not clone this repository inside the upstream source tree as an RTU add-on**. Instead clone it into its own directory as shown above. The project supplies its own modified `sim/simx/rtu` and cache files; it does not replace your existing installation. Reuse the prebuilt toolchain if compatible, then configure and build this checkout separately.
+
+### Existing developer checkout
+
+The remaining commands assume this project lives at `~/vortex/ttp` with its build at `~/vortex/ttp/build`. Adjust those paths if you cloned elsewhere. Keep the RTU extension enabled while compiling SimX.
 
 ### Build the SimX runtime after RTU changes
 
