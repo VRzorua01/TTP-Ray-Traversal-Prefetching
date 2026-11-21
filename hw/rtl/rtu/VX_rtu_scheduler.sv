@@ -39,8 +39,8 @@
 // id as a tag: a memory response, a tri/box/xform/reciprocal result, a ray
 // landing at launch. The event sets the context's wake bit and, where there is
 // data, writes it into a context-indexed result RAM that the next SELECT reads
-// back. A structural conflict (memory port busy, a full queue) re-arms the
-// wake bit and retries — there is no stall network.
+// back. A structural conflict (memory port busy, a full commit queue, no free 
+// collector entry) parks the context on that resource until its level clears.
 //
 // Results leave through the window store: a {slot, word} row RAM holding the
 // committed-hit and candidate records one field-row (all lanes) per word, so
@@ -1334,6 +1334,11 @@ module VX_rtu_scheduler import VX_gpu_pkg::*, VX_fpu_pkg::*, VX_rtu_pkg::*; #(
     reg [LVLW-1:0]  path_wlvl_r;
     reg [PATHW-1:0] path_wdata_r;
 
+    // Park instead of retry if commit queue full
+    // Park instead of retry if no free collector entry
+    reg         cf_blk;
+    reg         coll_blk;
+
     // The issue block below reads the grant only where it has just set
     // mem_issue, so it uses mem_grant: reading mem_fire would feed its own
     // output back into itself (a combinational loop to Verilator).
@@ -1372,6 +1377,10 @@ module VX_rtu_scheduler import VX_gpu_pkg::*, VX_fpu_pkg::*, VX_rtu_pkg::*; #(
         coll_alloc_r  = 1'b0;
         coll_free_r   = 1'b0;
         cf_push_r     = 1'b0;
+
+        cf_blk        = 1'b0;
+        coll_blk      = 1'b0;
+
         cf_din_r      = '0;
         sp_inc        = 1'b0;
         sp_dec        = 1'b0;
@@ -1503,6 +1512,8 @@ module VX_rtu_scheduler import VX_gpu_pkg::*, VX_fpu_pkg::*, VX_rtu_pkg::*; #(
                     word_n.coll_id  = coll_alloc_idx;
                     word_n.feed_idx = '0;
                     word_n.cstate   = CS_FEED;
+                end else begin
+                    coll_blk = 1'b1;
                 end
                 wake_self = 1'b1;   // retries while no collector entry is free
             end else if (node_kind == RTU_KIND_LEAF_TRI) begin
@@ -1529,6 +1540,7 @@ module VX_rtu_scheduler import VX_gpu_pkg::*, VX_fpu_pkg::*, VX_rtu_pkg::*; #(
                     word_n.cstate    = CS_PROC_WAIT;
                 end else begin
                     wake_self = 1'b1;
+                    coll_blk = 1'b1;
                 end
             end else if (node_kind == RTU_KIND_LEAF_INST && leaf_count != 8'd0) begin
                 // a restart following its path resumes at the recorded instance
@@ -1634,6 +1646,8 @@ module VX_rtu_scheduler import VX_gpu_pkg::*, VX_fpu_pkg::*, VX_rtu_pkg::*; #(
                     word_n.yld_ko = word_x.cur_off;
                     coll_free_r   = 1'b1;
                     word_n.cstate = CS_POP;
+                end else begin
+                    cf_blk = 1'b1;
                 end
                 wake_self = 1'b1;   // retries while the commit queue is full
             end else begin
@@ -1696,6 +1710,7 @@ module VX_rtu_scheduler import VX_gpu_pkg::*, VX_fpu_pkg::*, VX_rtu_pkg::*; #(
                 cf_din_r.geom = tri_geom;
                 if (cf_full) begin
                     wake_self = 1'b1;
+                    cf_blk = 1'b1;
                 end else begin
                     cf_push_r     = 1'b1;
                     exec_hit_set  = 1'b1;
@@ -1964,6 +1979,85 @@ module VX_rtu_scheduler import VX_gpu_pkg::*, VX_fpu_pkg::*, VX_rtu_pkg::*; #(
     // take priority over the in-flight grant's clear. The two deep sources
     // (EXEC self-wake, box-collection wake) are registered before joining
     // the vector; the long-latency event wakes enter combinationally.
+    
+    localparam [NUM_PK-1:0][2:0] PK_GAP = {3'd4, 3'd4, 3'd0};
+
+    wire [NUM_PK-1:0] pk_park = {x_valid && coll_blk,
+                                 x_valid && cf_blk,
+                                 x_valid && mem_issue && !mem_req_ready};
+    wire [NUM_PK-1:0] pk_ok   = {coll_alloc_ok, ~cf_full, mem_req_ready};
+
+    wire [NUM_PK-1:0]                pk_rel_r_w;
+    wire [NUM_PK-1:0][CTX_TAG_W-1:0] pk_rel_ctx_w;
+
+    for (genvar c = 0; c < NUM_PK; ++c) begin : g_park
+        reg [NUM_CTX-1:0]     q;
+        reg [2:0]             hold;
+        reg                   rel_r;
+        reg [CTX_TAG_W-1:0]   rel_ctx_r;
+        reg [3:0]             idle_cnt;
+
+        wire                  gv;
+        wire [CTX_TAG_W-1:0]  gi;
+        wire                  go  = pk_ok[c] && (hold == 3'd0);
+        wire                  rel = gv && go;
+
+        VX_rr_arbiter #(
+            .NUM_REQS (NUM_CTX)
+        ) arb (
+            .clk          (clk),
+            .reset        (reset),
+            .requests     (q),
+            .grant_index  (gi),
+            `UNUSED_PIN   (grant_onehot),
+            .grant_valid  (gv),
+            .grant_ready  (go)      // fairness pointer advances only on a real release
+        );
+
+        always_ff @(posedge clk) begin
+            if (reset) begin
+                q        <= '0;
+                hold     <= '0;
+                rel_r    <= 1'b0;
+                idle_cnt <= '0;
+            end else begin
+                rel_r     <= rel;
+                rel_ctx_r <= gi;
+                if (rel) begin
+                    q[gi] <= 1'b0;
+                    hold  <= PK_GAP[c];
+                end else if (hold != 3'd0) begin
+                    hold  <= hold - 3'd1;
+                end
+                if (pk_park[c]) begin
+                    q[sel_q] <= 1'b1;   // sel_q is in the pipeline, so never already parked
+                end
+                // liveness: parked contexts + resource available must release soon
+                if (rel || !((| q) && pk_ok[c])) begin
+                    idle_cnt <= '0;
+                end else if (idle_cnt != 4'd15) begin
+                    idle_cnt <= idle_cnt + 4'd1;
+                end
+            end
+        end
+        `RUNTIME_ASSERT(idle_cnt < 4'd10,
+            ("%t: *** %s: park class %0d holds contexts with its resource free but never releases",
+                $time, INSTANCE_ID, c))
+
+        assign pk_rel_r_w[c]   = rel_r;
+        assign pk_rel_ctx_w[c] = rel_ctx_r;
+    end
+
+    reg [NUM_CTX-1:0] pk_wake;
+    always @(*) begin
+        pk_wake = '0;
+        for (integer c = 0; c < NUM_PK; c = c + 1) begin
+            if (pk_rel_r_w[c]) begin
+                pk_wake = pk_wake | (NUM_CTX'(1) << pk_rel_ctx_w[c]);
+            end
+        end
+    end
+    
     reg                 wake_self_r;
     reg [CTX_TAG_W-1:0] wake_self_ctx_r;
     reg                 box_wake_r;
@@ -1973,7 +2067,8 @@ module VX_rtu_scheduler import VX_gpu_pkg::*, VX_fpu_pkg::*, VX_rtu_pkg::*; #(
             wake_self_r <= 1'b0;
             box_wake_r  <= 1'b0;
         end else begin
-            wake_self_r     <= x_valid && wake_self;
+
+            wake_self_r     <= x_valid && wake_self && !(| pk_park);
             wake_self_ctx_r <= sel_q;
             box_wake_r      <= box_valid_out
                             && (coll_proc[box_coll] || (coll_cnt[box_coll] == coll_last[box_coll]));
@@ -1993,6 +2088,7 @@ module VX_rtu_scheduler import VX_gpu_pkg::*, VX_fpu_pkg::*, VX_rtu_pkg::*; #(
       | ((recip_valid_out && recip_last_out) ? NUM_CTX'(1) << recip_tag_out : NUM_CTX'(0))
       | (box_wake_r                         ? NUM_CTX'(1) << box_wake_ctx_r : NUM_CTX'(0))
       | (wake_self_r                        ? NUM_CTX'(1) << wake_self_ctx_r : NUM_CTX'(0))
+      | pk_wake
       | rewalk_wake;
 
     assign rdy_next = (rdy_set & ~g1_onehot) | rdy_wake_mask;
